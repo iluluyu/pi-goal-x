@@ -366,6 +366,7 @@ export function registerGoalEvents(core: GoalCore): void {
 			// consecutive recovery count for a later failed retry.
 			core.clearContinuationState(false);
 			if (!core.isActionableContinuationGoal(incomingGoalId)) {
+				core.runningGoalId = core.state.goal?.status === "active" ? core.state.goal.id : null;
 				try {
 					ctx.abort?.();
 				} catch {}

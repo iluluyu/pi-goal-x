@@ -29,7 +29,6 @@ import {
 	type GoalRecord,
 	type GoalStateEntry,
 } from "../extensions/goal-record.ts";
-import { writeActiveGoalFile } from "../extensions/storage/goal-files.ts";
 
 const FIXTURE_GOAL = readFileSync(new URL("./fixtures/goals/active_goal_fixture.md", import.meta.url), "utf8");
 
@@ -408,6 +407,51 @@ test("empty no-tool runs continue implicitly after agent_settled", async () => {
 		await h.handlers["agent_settled"]!({}, idleCtx(h.ctx));
 		assert.equal(await countCheckpoints(h), 2, "missing declarations never require repair in default mode");
 		assert.equal(h.core.state.goal?.status, "active");
+	} finally {
+		h.core.scheduler.shutdown();
+		h.core.runtime.clearContinuationState();
+	}
+});
+
+test("regression: aborted stale checkpoint still refreshes runningGoalId to the focused goal", async () => {
+	// Scenario (observed in a live session): goal A was focused with an
+	// actionable continuation, so runningGoalId bound to A. Mid-run, the
+	// create_goal tool focused a new goal B (its queued continuation
+	// checkpoint for A was still in flight). On the next turn A's checkpoint
+	// arrives, is correctly judged stale, and aborts — but the abort path
+	// returned before the runningGoalId refresh, leaving runningGoalId=A while
+	// the focus was B. update_goal(B, complete) then failed validation with
+	// "The active goal changed during this run" until a user command or a
+	// fresh actionable checkpoint repaired the binding.
+	const { cwd, goal: goalA } = fixtureCwd();
+	const h = createHarness(cwd);
+	try {
+		const entries = sessionEntriesFor(goalA);
+		// Later hooks use h.ctx itself, not startSession's cloned context.
+		h.ctx.sessionManager.getBranch = () => entries as unknown as ReturnType<typeof h.ctx.sessionManager.getBranch>;
+		await startSession(h.handlers, h.ctx, entries);
+		const bas = h.handlers["before_agent_start"];
+		assert.ok(bas);
+
+		// Run for A: its checkpoint is actionable and binds runningGoalId to A.
+		await bas({ systemPrompt: "base", prompt: `<pi_goal_continuation goal_id="${goalA.id}" kind="checkpoint">continue`, systemPromptOptions: {} }, h.ctx);
+		assert.equal(h.aborts, 0);
+		assert.equal(h.core.runningGoalId, goalA.id, "actionable checkpoint binds runningGoalId");
+
+		// Use create_goal's actual creation path: disk writes and focus entries
+		// alone do not switch the in-memory focus during reconciliation.
+		h.core.replaceGoal({ objective: "Newly created goal", autoContinue: true, sisyphus: false }, h.ctx, true);
+		const writtenB = h.core.state.goal;
+		assert.ok(writtenB);
+		entries.push({ type: "custom", customType: "pi-goal-focus", data: goalFocusDetails(writtenB.id, "created") });
+		assert.equal(h.core.runningGoalId, goalA.id, "creating B must retain A's current-run binding");
+
+		// A's queued checkpoint arrives on the next turn: stale, aborted.
+		await bas({ systemPrompt: "base", prompt: `<pi_goal_continuation goal_id="${goalA.id}" kind="checkpoint">continue`, systemPromptOptions: {} }, h.ctx);
+		assert.equal(h.aborts, 1, "stale checkpoint must abort the turn");
+		assert.equal(h.core.state.goal?.id, writtenB.id, "focus must remain on newly created B");
+		assert.equal(h.core.runningGoalId, writtenB.id,
+			"an aborted stale checkpoint must still refresh runningGoalId to the focused goal");
 	} finally {
 		h.core.scheduler.shutdown();
 		h.core.runtime.clearContinuationState();
